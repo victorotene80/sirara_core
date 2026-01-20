@@ -1,0 +1,8 @@
+[package]
+name = "sirara_core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror = "2.0.18"
+uuid = { version = "1.19.0", features = ["v4"] }
