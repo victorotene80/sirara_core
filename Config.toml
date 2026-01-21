@@ -1,0 +1,4 @@
+[db]
+max_connections = 20
+min_connections = 1
+acquire_timeout_secs = 10

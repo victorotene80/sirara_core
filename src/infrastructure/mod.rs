@@ -1,1 +1,2 @@
 mod persistence;
+mod error;

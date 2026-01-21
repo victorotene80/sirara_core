@@ -1,5 +1,6 @@
 mod commands;
 mod query;
 mod dtos;
-mod contracts;
+pub mod contracts;
 mod error;
+mod services;
