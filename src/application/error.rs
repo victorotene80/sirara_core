@@ -11,6 +11,9 @@ pub enum AppError {
     #[error(transparent)]
     Repo(#[from] RepoError),
 
+    #[error(transparent)]
+    Uuid(#[from] uuid::Error),
+
     #[error("query repository error")]
     QueryRepo {
         #[source]

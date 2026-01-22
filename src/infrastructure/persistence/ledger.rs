@@ -1,7 +1,4 @@
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
-
 use async_trait::async_trait;
 use bigdecimal::BigDecimal;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -218,13 +215,14 @@ impl PgLedgerRepository {
         tx_id: i64,
         account_ids: &[i64],
         amounts: &[BigDecimal],
-    ) -> Result<(), RepoError> {
-        sqlx::query(
+    ) -> Result<u64, RepoError> {
+        let res = sqlx::query(
             r#"
-            INSERT INTO journal_lines (journal_tx_id, account_id, amount)
-            SELECT $1, x.account_id, x.amount
-            FROM UNNEST($2::bigint[], $3::numeric[]) AS x(account_id, amount)
-            "#,
+        INSERT INTO journal_lines (journal_tx_id, account_id, amount)
+        SELECT $1, x.account_id, x.amount
+        FROM UNNEST($2::bigint[], $3::numeric[]) AS x(account_id, amount)
+        ON CONFLICT (journal_tx_id, account_id) DO NOTHING
+        "#,
         )
             .bind(tx_id)
             .bind(account_ids)
@@ -233,8 +231,9 @@ impl PgLedgerRepository {
             .await
             .map_err(map_sqlx)?;
 
-        Ok(())
+        Ok(res.rows_affected())
     }
+
 
     fn numeric0_to_i128_strict(v: &BigDecimal, account_id: i64) -> Result<i128, RepoError> {
         let s = v.to_string();
@@ -351,14 +350,14 @@ impl PgLedgerRepository {
             deltas.push(i128_to_bigdecimal(*d));
         }
 
-        sqlx::query(
+        let res = sqlx::query(
             r#"
-            UPDATE ledger_account_balances b
-            SET balance = b.balance + x.delta,
-                updated_at = now()
-            FROM UNNEST($1::bigint[], $2::numeric[]) AS x(account_id, delta)
-            WHERE b.account_id = x.account_id
-            "#,
+        UPDATE ledger_account_balances b
+        SET balance = b.balance + x.delta,
+            updated_at = now()
+        FROM UNNEST($1::bigint[], $2::numeric[]) AS x(account_id, delta)
+        WHERE b.account_id = x.account_id
+        "#,
         )
             .bind(&ids)
             .bind(&deltas)
@@ -366,11 +365,22 @@ impl PgLedgerRepository {
             .await
             .map_err(map_sqlx)?;
 
+        let expected = ids.len() as u64;
+        let actual = res.rows_affected();
+
+        if actual != expected {
+            return Err(RepoError::Integrity {
+                message: format!(
+                    "balance update mismatch: expected to update {expected} rows, updated {actual}. \
+                 missing balance rows or type mismatch? account_ids={ids:?}"
+                ),
+            });
+        }
+
         Ok(())
     }
 }
-
-#[async_trait]
+    #[async_trait]
 impl LedgerRepository for PgLedgerRepository {
     async fn create_account(&self, spec: NewLedgerAccountSpec) -> Result<LedgerAccount, RepoError> {
         let row = sqlx::query_as::<_, LedgerAccountRow>(
@@ -660,10 +670,40 @@ impl LedgerRepositoryTx for PgLedgerRepository {
             line_account_ids.push(l.account_id);
             line_amounts.push(i128_to_bigdecimal(l.amount.minor()));
         }
+
+        // 8) Bulk insert journal lines (idempotent w/ unique (tx_id, account_id))
+        let inserted = Self::bulk_insert_lines(tx, tx_id, &line_account_ids, &line_amounts).await?;
+
+        // If 0 inserted, someone else already posted (idempotent replay / concurrent winner)
+        // Return the existing posted journal without applying deltas again.
+        if inserted == 0 {
+            return Self::load_posted_by_tx_id_tx(tx, tx_id).await;
+        }
+
+        // Safety: partial insert should never happen if your ValidatedJournal is compressed,
+        // but protect against mismatch anyway.
+        let expected = line_account_ids.len() as u64;
+        if inserted != expected {
+            return Err(RepoError::Integrity {
+                message: format!(
+                    "partial insert for journal_lines: expected {expected}, inserted {inserted}. \
+             This indicates inconsistent posting input or schema mismatch."
+                ),
+            });
+        }
+
+        // 9) Update running balances ONLY if we inserted lines now
+        Self::apply_balance_deltas(tx, &delta).await?;
+
+        // 10) Return posted journal
+        Self::load_posted_by_tx_id_tx(tx, tx_id).await
+
+
+        /*
         Self::bulk_insert_lines(tx, tx_id, &line_account_ids, &line_amounts).await?;
 
         Self::apply_balance_deltas(tx, &delta).await?;
 
-        Self::load_posted_by_tx_id_tx(tx, tx_id).await
+        Self::load_posted_by_tx_id_tx(tx, tx_id).await*/
     }
 }

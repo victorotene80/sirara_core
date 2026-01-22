@@ -1,14 +1,11 @@
 use serde::{Deserialize, Serialize};
 use crate::application::dtos::JournalLineDTO;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PostedJournalDTO {
-    pub db_id: i64,
+pub struct PostJournalRequestDTO {
     pub public_id: String,
     pub external_ref_type: String,
     pub external_ref: String,
     pub description: Option<String>,
     pub created_by: String,
-    pub asset_id: i16,
     pub lines: Vec<JournalLineDTO>,
 }

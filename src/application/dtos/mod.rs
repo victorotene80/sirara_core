@@ -2,14 +2,16 @@ mod ledger_account;
 mod journal;
 mod journal_line;
 mod account_balance;
-mod owner_balance;
 mod list_journal_filter;
+mod create_account;
+mod post_journal;
+pub mod mappers;
 
 pub use self::{
-    journal::JournalDTO,
     journal_line::JournalLineDTO,
     account_balance::AccountBalanceDTO,
-    owner_balance::OwnerBalancesDTO,
+    create_account::CreateAccountDTO,
+    journal::PostedJournalDTO,
     ledger_account::LedgerAccountDTO,
-    list_journal_filter::ListJournalsFilterDTO
+    post_journal::PostJournalRequestDTO
 };

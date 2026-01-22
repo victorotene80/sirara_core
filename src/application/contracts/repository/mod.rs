@@ -1,4 +1,5 @@
 mod ledger_a;
-pub mod uow;
+mod uow;
+pub use uow::{UnitOfWork, BoxFut};
 mod ledger;
 pub use ledger::LedgerRepositoryTx;

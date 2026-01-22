@@ -1,7 +1,7 @@
 use sqlx::{PgPool, Postgres, Transaction};
 use crate::domain::repository::RepoError;
 use crate::infrastructure::persistence::error_map::map_sqlx;
-use crate::application::contracts::repository::uow::{UnitOfWork, BoxFut};
+use crate::application::contracts::repository::{UnitOfWork, BoxFut};
 
 pub struct PgUnitOfWork {
     pool: PgPool,

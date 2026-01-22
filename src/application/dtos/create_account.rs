@@ -1,10 +1,6 @@
-use uuid::uuid;
 use serde::{Deserialize, Serialize};
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LedgerAccountDTO {
-    pub id: i64,
-    pub public_id: String,
+pub struct CreateAccountDTO {
     pub owner_type: String,
     pub owner_id: Option<String>,
     pub account_type: String,
