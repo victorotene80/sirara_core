@@ -1,8 +1,19 @@
 use crate::domain::aggregate::{JournalDraft, PostedJournal};
-
-#[derive(Debug, Clone)]
+use crate::domain::value_objects::{
+    PublicId,
+    ExternalRef,
+    ExternalRefType
+};
 pub struct PostJournalCommand {
-    pub draft: JournalDraft,
-    /// Optional safety limit against abuse
-    pub max_lines: usize,
+    pub public_id: PublicId,
+    pub external_ref_type: ExternalRefType,
+    pub external_ref: ExternalRef,
+    pub description: Option<String>,
+    pub created_by: String,
+    pub lines: Vec<PostJournalLineCommand>,
+}
+
+pub struct PostJournalLineCommand {
+    pub account_id: i64,
+    pub amount_minor: i128,
 }

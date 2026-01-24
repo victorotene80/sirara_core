@@ -1,15 +1,20 @@
 use std::future::Future;
 use std::pin::Pin;
-use sqlx::{Postgres, Transaction};
-use crate::domain::repository::RepoError;
+
+use crate::application::AppError;
+use crate::application::contracts::repository::LedgerRepositoryTx;
 
 pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+pub trait ReposInTx: Send {
+    fn ledger<'a>(&'a mut self) -> Box<dyn LedgerRepositoryTx + 'a>;
+}
+
 pub trait UnitOfWork: Send + Sync {
-    fn with_tx<'u, T: Send + 'u>(
-        &'u self,
-        f: impl for<'a> FnOnce(&'a mut Transaction<'_, Postgres>) -> BoxFut<'a, Result<T, RepoError>>
+    fn with_tx<'a, T: Send + 'a>(
+        &'a self,
+        f: impl for<'tx> FnOnce(&'tx mut dyn ReposInTx) -> BoxFut<'tx, Result<T, AppError>>
         + Send
-        + 'u,
-    ) -> BoxFut<'u, Result<T, RepoError>>;
+        + 'a,
+    ) -> BoxFut<'a, Result<T, AppError>>;
 }

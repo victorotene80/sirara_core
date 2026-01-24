@@ -2,3 +2,12 @@
 max_connections = 20
 min_connections = 1
 acquire_timeout_secs = 10
+
+[ledger]
+max_lines_normal = 200
+max_lines_batch = 5000
+
+[ledger.max_post_amount]
+NGN = 10000000000     # ₦100,000,000
+USDT = 1000000000000  # 1,000,000 USDT (6 decimals)
+KES = 50000000000     # 50,000,000 KES

@@ -26,6 +26,12 @@ pub enum AppError {
     #[error("entity not found: {entity}")]
     NotFound { entity: String },
 
-    #[error("unexpected application error: {message}")]
-    Unexpected { message: String },
+    #[error("transient error: {0}")]
+    Transient(String),
+
+    #[error("rejected: {0}")]
+    Rejected(String),
+
+    #[error("unexpected error: {0}")]
+    Unexpected(String),
 }

@@ -1,25 +1,30 @@
 use anyhow::Context;
 
-use crate::utils::configuration::{database};
+use super::database::{self, DatabaseConfig, DatabaseToml};
+use super::ledger::{self, LedgerConfig, LedgerToml};
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub database: database::DatabaseConfig,
+    pub database: DatabaseConfig,
+    pub ledger: LedgerConfig,
 }
 
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
         let _ = dotenvy::dotenv();
         let toml = load_toml()?;
-        Ok(Self {
-            database: database::load(&toml)?,
-        })
+
+        let database = database::load(&toml)?;
+        let ledger = ledger::load(&toml)?;
+
+        Ok(Self { database, ledger })
     }
 }
 
 #[derive(Debug, serde::Deserialize, Clone)]
 pub(crate) struct TomlConfig {
-    pub db: database::DatabaseToml,
+    pub db: DatabaseToml,
+    pub ledger: LedgerToml,
 }
 
 fn load_toml() -> anyhow::Result<TomlConfig> {

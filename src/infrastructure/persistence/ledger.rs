@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+
 use async_trait::async_trait;
 use bigdecimal::BigDecimal;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -11,9 +12,6 @@ use crate::domain::value_objects::{ExternalRef, ExternalRefType};
 use crate::infrastructure::persistence::error_map::map_sqlx;
 use crate::infrastructure::persistence::mappers::{i128_to_bigdecimal, map_posted_journal};
 use crate::infrastructure::persistence::models::{JournalLineRow, JournalTxRow, LedgerAccountRow};
-use crate::application::contracts::repository::LedgerRepositoryTx;
-
-//type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub struct PgLedgerRepository {
     pool: PgPool,
@@ -23,31 +21,119 @@ impl PgLedgerRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
-    /*async fn with_tx<T>(
-        &self,
-        f: impl for<'a> FnOnce(&'a mut Transaction<'_, Postgres>) -> BoxFut<'a, Result<T, RepoError>>
-        + Send,
-    ) -> Result<T, RepoError> {
-        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        let res = f(&mut tx).await;
-
-        match res {
-            Ok(v) => {
-                tx.commit().await.map_err(map_sqlx)?;
-                Ok(v)
-            }
-            Err(e) => {
-                tx.rollback().await.map_err(map_sqlx)?;
-                Err(e)
-            }
-        }
-    }*/
 
     fn is_spendable_bucket(t: AccountType) -> bool {
         matches!(
             t,
             AccountType::UserAvailable | AccountType::TreasuryAvailable | AccountType::InventoryAvailable
         )
+    }
+
+    pub(crate) async fn insert_posting_atomic_on_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        posting: ValidatedJournal,
+    ) -> Result<PostedJournal, RepoError> {
+        let tx_id = Self::insert_or_get_tx_id(tx, &posting).await?;
+
+        // If already posted (lines exist), return existing
+        if Self::tx_has_lines(tx, tx_id).await? {
+            return Self::load_posted_by_tx_id_tx(tx, tx_id).await;
+        }
+
+        // 2) Lock affected accounts in stable order
+        let mut account_ids: Vec<i64> = posting.lines.iter().map(|l| l.account_id).collect();
+        account_ids.sort_unstable();
+        account_ids.dedup();
+
+        let locked_rows = Self::fetch_accounts_for_update(tx, &account_ids).await?;
+        if locked_rows.len() != account_ids.len() {
+            return Err(RepoError::NotFound {
+                entity: "one or more ledger accounts missing".into(),
+            });
+        }
+
+        // 3) Map rows -> domain and validate active
+        let mut locked: HashMap<i64, LedgerAccount> = HashMap::with_capacity(locked_rows.len());
+        for r in locked_rows {
+            let acct = r.to_domain()?;
+            if !acct.is_active() {
+                return Err(RepoError::Integrity {
+                    message: format!("ledger account is inactive (account_id={})", acct.id()),
+                });
+            }
+            locked.insert(acct.id(), acct);
+        }
+
+        // 4) Enforce single-asset journal
+        let _asset_id = Self::ensure_single_asset(tx, &account_ids).await?;
+
+        // 5) Lock+fetch running balances (FOR UPDATE)
+        let current = Self::lock_and_fetch_balances(tx, &account_ids).await?;
+
+        // 6) Compute deltas (overflow-safe)
+        let mut delta: HashMap<i64, i128> = HashMap::with_capacity(posting.lines.len());
+        for l in &posting.lines {
+            let entry = delta.entry(l.account_id).or_insert(0);
+            *entry = entry.checked_add(l.amount.minor()).ok_or_else(|| RepoError::Integrity {
+                message: format!("delta overflow (account_id={})", l.account_id),
+            })?;
+        }
+
+        // 7) Validate spendability against running balances
+        for (account_id, d) in &delta {
+            let acct = locked.get(account_id).ok_or_else(|| RepoError::NotFound {
+                entity: format!("ledger_account id={account_id}"),
+            })?;
+
+            if Self::is_spendable_bucket(acct.account_type()) {
+                let cur = *current.get(account_id).unwrap_or(&0);
+                let next = cur.checked_add(*d).ok_or_else(|| RepoError::Integrity {
+                    message: format!("balance overflow (account_id={account_id})"),
+                })?;
+
+                if next < 0 {
+                    return Err(RepoError::Conflict {
+                        message: format!(
+                            "insufficient funds (account_id={account_id}, current={cur}, delta={d})"
+                        ),
+                    });
+                }
+            }
+        }
+
+        // 8) Bulk insert journal lines (idempotent w/ unique (journal_tx_id, account_id))
+        let mut line_account_ids = Vec::with_capacity(posting.lines.len());
+        let mut line_amounts = Vec::with_capacity(posting.lines.len());
+        for l in &posting.lines {
+            line_account_ids.push(l.account_id);
+            line_amounts.push(i128_to_bigdecimal(l.amount.minor()));
+        }
+
+        let inserted = Self::bulk_insert_lines(tx, tx_id, &line_account_ids, &line_amounts).await?;
+
+        // If 0 inserted, someone else already posted (idempotent replay / concurrent winner)
+        // Return the existing posted journal without applying deltas again.
+        if inserted == 0 {
+            return Self::load_posted_by_tx_id_tx(tx, tx_id).await;
+        }
+
+        // Safety: partial insert should never happen if your ValidatedJournal is “compressed”,
+        // but protect against mismatch anyway.
+        let expected = line_account_ids.len() as u64;
+        if inserted != expected {
+            return Err(RepoError::Integrity {
+                message: format!(
+                    "partial insert for journal_lines: expected {expected}, inserted {inserted}. \
+                     This indicates inconsistent posting input or schema mismatch."
+                ),
+            });
+        }
+
+        // 9) Update running balances ONLY if we inserted lines now
+        Self::apply_balance_deltas(tx, &delta).await?;
+
+        // 10) Return posted journal
+        Self::load_posted_by_tx_id_tx(tx, tx_id).await
     }
 
     async fn fetch_accounts_for_update(
@@ -218,11 +304,11 @@ impl PgLedgerRepository {
     ) -> Result<u64, RepoError> {
         let res = sqlx::query(
             r#"
-        INSERT INTO journal_lines (journal_tx_id, account_id, amount)
-        SELECT $1, x.account_id, x.amount
-        FROM UNNEST($2::bigint[], $3::numeric[]) AS x(account_id, amount)
-        ON CONFLICT (journal_tx_id, account_id) DO NOTHING
-        "#,
+            INSERT INTO journal_lines (journal_tx_id, account_id, amount)
+            SELECT $1, x.account_id, x.amount
+            FROM UNNEST($2::bigint[], $3::numeric[]) AS x(account_id, amount)
+            ON CONFLICT (journal_tx_id, account_id) DO NOTHING
+            "#,
         )
             .bind(tx_id)
             .bind(account_ids)
@@ -233,7 +319,6 @@ impl PgLedgerRepository {
 
         Ok(res.rows_affected())
     }
-
 
     fn numeric0_to_i128_strict(v: &BigDecimal, account_id: i64) -> Result<i128, RepoError> {
         let s = v.to_string();
@@ -334,6 +419,7 @@ impl PgLedgerRepository {
 
         Ok(asset_id)
     }
+
     async fn apply_balance_deltas(
         tx: &mut Transaction<'_, Postgres>,
         delta: &HashMap<i64, i128>,
@@ -352,12 +438,12 @@ impl PgLedgerRepository {
 
         let res = sqlx::query(
             r#"
-        UPDATE ledger_account_balances b
-        SET balance = b.balance + x.delta,
-            updated_at = now()
-        FROM UNNEST($1::bigint[], $2::numeric[]) AS x(account_id, delta)
-        WHERE b.account_id = x.account_id
-        "#,
+            UPDATE ledger_account_balances b
+            SET balance = b.balance + x.delta,
+                updated_at = now()
+            FROM UNNEST($1::bigint[], $2::numeric[]) AS x(account_id, delta)
+            WHERE b.account_id = x.account_id
+            "#,
         )
             .bind(&ids)
             .bind(&deltas)
@@ -372,7 +458,7 @@ impl PgLedgerRepository {
             return Err(RepoError::Integrity {
                 message: format!(
                     "balance update mismatch: expected to update {expected} rows, updated {actual}. \
-                 missing balance rows or type mismatch? account_ids={ids:?}"
+                     missing balance rows or type mismatch? account_ids={ids:?}"
                 ),
             });
         }
@@ -380,7 +466,8 @@ impl PgLedgerRepository {
         Ok(())
     }
 }
-    #[async_trait]
+
+#[async_trait]
 impl LedgerRepository for PgLedgerRepository {
     async fn create_account(&self, spec: NewLedgerAccountSpec) -> Result<LedgerAccount, RepoError> {
         let row = sqlx::query_as::<_, LedgerAccountRow>(
@@ -489,221 +576,9 @@ impl LedgerRepository for PgLedgerRepository {
             .await
             .map_err(map_sqlx)?;
 
-        let Some(id) = tx_id else { return Ok(None); };
+        let Some(id) = tx_id else { return Ok(None) };
 
         // Read method: use pool loader (avoids any tx lifetime gymnastics)
         Ok(Some(Self::load_posted_by_tx_id(&self.pool, id).await?))
-    }
-
-   /* async fn insert_posting_atomic(&self, posting: ValidatedJournal) -> Result<PostedJournal, RepoError> {
-        self.with_tx(|tx| {
-            Box::pin(async move {
-                // 1) Idempotent header insert/get
-                let tx_id = Self::insert_or_get_tx_id(tx, &posting).await?;
-
-                // If already posted (lines exist), return existing
-                if Self::tx_has_lines(tx, tx_id).await? {
-                    return Self::load_posted_by_tx_id_tx(tx, tx_id).await;
-                }
-
-                // 2) Lock affected accounts in stable order
-                let mut account_ids: Vec<i64> = posting.lines.iter().map(|l| l.account_id).collect();
-                account_ids.sort_unstable();
-                account_ids.dedup();
-
-                let locked_rows = Self::fetch_accounts_for_update(tx, &account_ids).await?;
-                if locked_rows.len() != account_ids.len() {
-                    return Err(RepoError::NotFound {
-                        entity: "one or more ledger accounts missing".into(),
-                    });
-                }
-
-                // 3) Map rows -> domain and validate active
-                let mut locked: HashMap<i64, LedgerAccount> = HashMap::with_capacity(locked_rows.len());
-                for r in locked_rows {
-                    let acct = r.to_domain()?;
-                    if !acct.is_active() {
-                        return Err(RepoError::Integrity {
-                            message: format!("ledger account is inactive (account_id={})", acct.id()),
-                        });
-                    }
-                    locked.insert(acct.id(), acct);
-                }
-
-                // 4) Enforce single-asset journal
-                let _asset_id = Self::ensure_single_asset(tx, &account_ids).await?;
-
-                // 5) Lock+fetch running balances (FOR UPDATE)
-                let current = Self::lock_and_fetch_balances(tx, &account_ids).await?;
-
-                // 6) Compute deltas (overflow-safe)
-                let mut delta: HashMap<i64, i128> = HashMap::with_capacity(posting.lines.len());
-                for l in &posting.lines {
-                    let entry = delta.entry(l.account_id).or_insert(0);
-                    *entry = entry
-                        .checked_add(l.amount.minor())
-                        .ok_or_else(|| RepoError::Integrity {
-                            message: format!("delta overflow (account_id={})", l.account_id),
-                        })?;
-                }
-
-                // 7) Validate spendability against running balances
-                for (account_id, d) in &delta {
-                    let acct = locked.get(account_id).ok_or_else(|| RepoError::NotFound {
-                        entity: format!("ledger_account id={account_id}"),
-                    })?;
-
-                    if Self::is_spendable_bucket(acct.account_type()) {
-                        let cur = *current.get(account_id).unwrap_or(&0);
-                        let next = cur.checked_add(*d).ok_or_else(|| RepoError::Integrity {
-                            message: format!("balance overflow (account_id={account_id})"),
-                        })?;
-
-                        if next < 0 {
-                            return Err(RepoError::Conflict {
-                                message: format!(
-                                    "insufficient funds (account_id={account_id}, current={cur}, delta={d})"
-                                ),
-                            });
-                        }
-                    }
-                }
-
-                // 8) Bulk insert journal lines (append-only)
-                let mut line_account_ids: Vec<i64> = Vec::with_capacity(posting.lines.len());
-                let mut line_amounts: Vec<BigDecimal> = Vec::with_capacity(posting.lines.len());
-                for l in &posting.lines {
-                    line_account_ids.push(l.account_id);
-                    line_amounts.push(i128_to_bigdecimal(l.amount.minor()));
-                }
-                Self::bulk_insert_lines(tx, tx_id, &line_account_ids, &line_amounts).await?;
-
-                // 9) Update running balances
-                Self::apply_balance_deltas(tx, &delta).await?;
-
-                // 10) Return posted journal from same tx snapshot
-                Self::load_posted_by_tx_id_tx(tx, tx_id).await
-            })
-        })
-            .await
-    }*/
-}
-
-#[async_trait]
-impl LedgerRepositoryTx for PgLedgerRepository {
-    async fn insert_posting_atomic_tx(
-        &self,
-        tx: &mut Transaction<'_, Postgres>,
-        posting: ValidatedJournal,
-    ) -> Result<PostedJournal, RepoError> {
-        // 1) Idempotent header insert/get
-        let tx_id = Self::insert_or_get_tx_id(tx, &posting).await?;
-
-        // If already posted (lines exist), return existing
-        if Self::tx_has_lines(tx, tx_id).await? {
-            return Self::load_posted_by_tx_id_tx(tx, tx_id).await;
-        }
-
-        // 2) Lock affected accounts in stable order
-        let mut account_ids: Vec<i64> = posting.lines.iter().map(|l| l.account_id).collect();
-        account_ids.sort_unstable();
-        account_ids.dedup();
-
-        let locked_rows = Self::fetch_accounts_for_update(tx, &account_ids).await?;
-        if locked_rows.len() != account_ids.len() {
-            return Err(RepoError::NotFound {
-                entity: "one or more ledger accounts missing".into(),
-            });
-        }
-
-        let mut locked: std::collections::HashMap<i64, LedgerAccount> =
-            std::collections::HashMap::with_capacity(locked_rows.len());
-
-        for r in locked_rows {
-            let acct = r.to_domain()?;
-            if !acct.is_active() {
-                return Err(RepoError::Integrity {
-                    message: format!("ledger account is inactive (account_id={})", acct.id()),
-                });
-            }
-            locked.insert(acct.id(), acct);
-        }
-
-        let _asset_id = Self::ensure_single_asset(tx, &account_ids).await?;
-
-        let current = Self::lock_and_fetch_balances(tx, &account_ids).await?;
-
-        let mut delta: std::collections::HashMap<i64, i128> =
-            std::collections::HashMap::with_capacity(posting.lines.len());
-
-        for l in &posting.lines {
-            let entry = delta.entry(l.account_id).or_insert(0);
-            *entry = entry.checked_add(l.amount.minor()).ok_or_else(|| RepoError::Integrity {
-                message: format!("delta overflow (account_id={})", l.account_id),
-            })?;
-        }
-
-        for (account_id, d) in &delta {
-            let acct = locked.get(account_id).ok_or_else(|| RepoError::NotFound {
-                entity: format!("ledger_account id={account_id}"),
-            })?;
-
-            if Self::is_spendable_bucket(acct.account_type()) {
-                let cur = *current.get(account_id).unwrap_or(&0);
-                let next = cur.checked_add(*d).ok_or_else(|| RepoError::Integrity {
-                    message: format!("balance overflow (account_id={account_id})"),
-                })?;
-
-                if next < 0 {
-                    return Err(RepoError::Conflict {
-                        message: format!(
-                            "insufficient funds (account_id={account_id}, current={cur}, delta={d})"
-                        ),
-                    });
-                }
-            }
-        }
-
-        let mut line_account_ids = Vec::with_capacity(posting.lines.len());
-        let mut line_amounts = Vec::with_capacity(posting.lines.len());
-        for l in &posting.lines {
-            line_account_ids.push(l.account_id);
-            line_amounts.push(i128_to_bigdecimal(l.amount.minor()));
-        }
-
-        // 8) Bulk insert journal lines (idempotent w/ unique (tx_id, account_id))
-        let inserted = Self::bulk_insert_lines(tx, tx_id, &line_account_ids, &line_amounts).await?;
-
-        // If 0 inserted, someone else already posted (idempotent replay / concurrent winner)
-        // Return the existing posted journal without applying deltas again.
-        if inserted == 0 {
-            return Self::load_posted_by_tx_id_tx(tx, tx_id).await;
-        }
-
-        // Safety: partial insert should never happen if your ValidatedJournal is compressed,
-        // but protect against mismatch anyway.
-        let expected = line_account_ids.len() as u64;
-        if inserted != expected {
-            return Err(RepoError::Integrity {
-                message: format!(
-                    "partial insert for journal_lines: expected {expected}, inserted {inserted}. \
-             This indicates inconsistent posting input or schema mismatch."
-                ),
-            });
-        }
-
-        // 9) Update running balances ONLY if we inserted lines now
-        Self::apply_balance_deltas(tx, &delta).await?;
-
-        // 10) Return posted journal
-        Self::load_posted_by_tx_id_tx(tx, tx_id).await
-
-
-        /*
-        Self::bulk_insert_lines(tx, tx_id, &line_account_ids, &line_amounts).await?;
-
-        Self::apply_balance_deltas(tx, &delta).await?;
-
-        Self::load_posted_by_tx_id_tx(tx, tx_id).await*/
     }
 }

@@ -1,7 +1,9 @@
-use sqlx::{PgPool, Postgres, Transaction};
-use crate::domain::repository::RepoError;
+use sqlx::PgPool;
+
+use crate::application::AppError;
+use crate::application::contracts::repository::{BoxFut, ReposInTx, UnitOfWork};
 use crate::infrastructure::persistence::error_map::map_sqlx;
-use crate::application::contracts::repository::{UnitOfWork, BoxFut};
+use crate::infrastructure::persistence::repos_in_tx::PgReposInTx;
 
 pub struct PgUnitOfWork {
     pool: PgPool,
@@ -14,23 +16,41 @@ impl PgUnitOfWork {
 }
 
 impl UnitOfWork for PgUnitOfWork {
-    fn with_tx<'u, T: Send + 'u>(
-        &'u self,
-        f: impl for<'a> FnOnce(&'a mut Transaction<'_, Postgres>) -> BoxFut<'a, Result<T, RepoError>>
+    fn with_tx<'a, T>(
+        &'a self,
+        f: impl for<'tx> FnOnce(&'tx mut dyn ReposInTx) -> BoxFut<'tx, Result<T, AppError>>
         + Send
-        + 'u,
-    ) -> BoxFut<'u, Result<T, RepoError>> {
+        + 'a,
+    ) -> BoxFut<'a, Result<T, AppError>>
+    where
+        T: Send + 'a,
+    {
         Box::pin(async move {
-            let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-            let res = f(&mut tx).await;
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(map_sqlx)
+                .map_err(AppError::from)?;
+
+            let res: Result<T, AppError> = {
+                let mut repos = PgReposInTx::new(&mut tx);
+                f(&mut repos).await
+            };
 
             match res {
                 Ok(v) => {
-                    tx.commit().await.map_err(map_sqlx)?;
+                    tx.commit()
+                        .await
+                        .map_err(map_sqlx)
+                        .map_err(AppError::from)?;
                     Ok(v)
                 }
                 Err(e) => {
-                    tx.rollback().await.map_err(map_sqlx)?;
+                    tx.rollback()
+                        .await
+                        .map_err(map_sqlx)
+                        .map_err(AppError::from)?;
                     Err(e)
                 }
             }

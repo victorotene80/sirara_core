@@ -1,6 +1,8 @@
 use anyhow::Context;
 use std::time::Duration;
 
+use super::config::TomlConfig;
+
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
     pub database_url: String,
@@ -16,7 +18,7 @@ pub(crate) struct DatabaseToml {
     pub acquire_timeout_secs: u64,
 }
 
-pub(crate) fn load(toml: &crate::utils::configuration::config::TomlConfig) -> anyhow::Result<DatabaseConfig> {
+pub(crate) fn load(toml: &TomlConfig) -> anyhow::Result<DatabaseConfig> {
     let database_url =
         std::env::var("DATABASE_URL").context("DATABASE_URL is required (env only)")?;
 
