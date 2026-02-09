@@ -1,3 +1,4 @@
 pub mod persistence;
 mod error;
-mod services;
+pub mod services;
+mod worker;

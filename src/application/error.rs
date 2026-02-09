@@ -34,4 +34,16 @@ pub enum AppError {
 
     #[error("unexpected error: {0}")]
     Unexpected(String),
+
+    #[error("conflict: {message}")]
+    Conflict { message: String },
+
+    #[error("invariant violated: {message}")]
+    Invariant { message: String },
+
+    #[error("insufficient funds (available_minor={available_minor}, required_minor={required_minor})")]
+    InsufficientFunds {
+        available_minor: i128,
+        required_minor: i128,
+    },
 }

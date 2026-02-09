@@ -5,14 +5,14 @@ use uuid::Uuid;
 
 #[derive(Debug, FromRow)]
 pub struct TransferExecutionRow {
-    pub id: i64,
-    pub intent_id: Uuid,
-    pub provider: String,
-    pub provider_ref: Option<String>,
-    pub status: String,
-    pub request: Option<Value>,
-    pub response: Option<Value>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub version: i32,
+    pub(crate) id: i64,
+    pub(crate) intent_id: Uuid,
+    pub(crate) provider: String,
+    pub(crate) provider_ref: Option<String>,
+    pub(crate) status: String,
+    pub(crate) request: Option<Value>,
+    pub(crate) response: Option<Value>,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) updated_at: DateTime<Utc>,
+    pub(crate) version: i32,
 }

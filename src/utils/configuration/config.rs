@@ -1,12 +1,17 @@
 use anyhow::Context;
-
-use super::database::{self, DatabaseConfig, DatabaseToml};
-use super::ledger::{self, LedgerConfig, LedgerToml};
+use crate::utils::configuration::database::{self, DatabaseConfig, DatabaseToml};
+use crate::utils::configuration::ledger::{self, LedgerConfig, LedgerToml};
+use crate::utils::configuration::fx::{self, FxConfig, FxToml,};
+use crate::utils::configuration::monnify::{self, MonnifyConfig, MonnifyToml};
+use crate::utils::configuration::chain::{self, ChainToml, ChainConfig};
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database: DatabaseConfig,
     pub ledger: LedgerConfig,
+    pub fx: FxConfig,
+    pub monnify: MonnifyConfig,
+    pub chain: ChainConfig,
 }
 
 impl Config {
@@ -16,8 +21,11 @@ impl Config {
 
         let database = database::load(&toml)?;
         let ledger = ledger::load(&toml)?;
+        let fx = fx::load(&toml)?;
+        let monnify = monnify::load(&toml)?;
+        let chain = chain::load(&toml)?;
 
-        Ok(Self { database, ledger })
+        Ok(Self { database, ledger, fx, monnify, chain })
     }
 }
 
@@ -25,6 +33,9 @@ impl Config {
 pub(crate) struct TomlConfig {
     pub db: DatabaseToml,
     pub ledger: LedgerToml,
+    pub fx: FxToml,
+    pub monnify: MonnifyToml,
+    pub chain: ChainToml,
 }
 
 fn load_toml() -> anyhow::Result<TomlConfig> {

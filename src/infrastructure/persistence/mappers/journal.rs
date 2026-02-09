@@ -1,20 +1,8 @@
-use bigdecimal::BigDecimal;
-use num_traits::ToPrimitive;
-
 use crate::domain::aggregate::{JournalLine, PostedJournal};
 use crate::domain::repository::RepoError;
 use crate::domain::value_objects::{ExternalRef, ExternalRefType, Money, PublicId};
 use crate::infrastructure::persistence::models::{JournalLineRow, JournalTxRow};
-
-pub fn bigdecimal_to_i128(d: &BigDecimal) -> Result<i128, RepoError> {
-    d.to_i128().ok_or_else(|| RepoError::Integrity {
-        message: "db numeric amount is not a valid i128 integer (out of range or non-integer)".into(),
-    })
-}
-
-pub fn i128_to_bigdecimal(v: i128) -> BigDecimal {
-    BigDecimal::from(v)
-}
+use crate::infrastructure::persistence::mappers::numeric;
 
 pub fn map_posted_journal(
     header: JournalTxRow,
@@ -39,11 +27,12 @@ pub fn map_posted_journal(
     for l in lines {
         let account_id = l.account_id;
 
-        let minor = bigdecimal_to_i128(&l.amount).map_err(|_| RepoError::Integrity {
+        let minor = numeric::bd_to_i128(&l.amount, "journal_line.amount").map_err(|_| RepoError::Integrity {
             message: format!(
                 "invalid journal line amount in db (tx_id={tx_id}, account_id={account_id}): not i128"
             ),
         })?;
+
 
         let money = Money::from_signed_minor(minor).map_err(|e| RepoError::Integrity {
             message: format!(

@@ -8,6 +8,7 @@ pub struct LedgerAccountDTO {
     pub owner_type: String,
     pub owner_id: Option<String>,
     pub account_type: String,
+    pub region_code: Option<String>,
     pub asset_id: i16,
     pub is_active: bool,
 }

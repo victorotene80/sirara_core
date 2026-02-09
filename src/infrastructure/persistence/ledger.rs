@@ -5,13 +5,13 @@ use bigdecimal::BigDecimal;
 use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::domain::aggregate::{PostedJournal, ValidatedJournal};
-use crate::domain::entities::{AccountType, LedgerAccount};
+use crate::domain::entities::{AccountType, LedgerAccount, OwnerType};
 use crate::domain::repository::{LedgerRepository, NewLedgerAccountSpec, RepoError};
 use crate::domain::value_objects::{ExternalRef, ExternalRefType};
 
 use crate::infrastructure::persistence::error_map::map_sqlx;
-use crate::infrastructure::persistence::mappers::{i128_to_bigdecimal, map_posted_journal};
-use crate::infrastructure::persistence::models::{JournalLineRow, JournalTxRow, LedgerAccountRow};
+use crate::infrastructure::persistence::mappers::{i128_to_bd, map_posted_journal, numeric0_to_i128_strict};
+use crate::infrastructure::persistence::models::{JournalLineRow, JournalTxRow, LedgerAccountRow, BalanceRow};
 
 pub struct PgLedgerRepository {
     pool: PgPool,
@@ -22,25 +22,28 @@ impl PgLedgerRepository {
         Self { pool }
     }
 
-    fn is_spendable_bucket(t: AccountType) -> bool {
+    fn is_non_negative_bucket(t: AccountType) -> bool {
         matches!(
             t,
-            AccountType::UserAvailable | AccountType::TreasuryAvailable | AccountType::InventoryAvailable
+            AccountType::UserAvailable
+            | AccountType::UserLocked
+            | AccountType::TreasuryAvailable
+            | AccountType::TreasuryLocked
+            | AccountType::InventoryAvailable
+            | AccountType::InventoryLocked
         )
     }
 
-    pub(crate) async fn insert_posting_atomic_on_tx(
+    pub async fn insert_posting_atomic_on_tx(
         tx: &mut Transaction<'_, Postgres>,
         posting: ValidatedJournal,
     ) -> Result<PostedJournal, RepoError> {
         let tx_id = Self::insert_or_get_tx_id(tx, &posting).await?;
 
-        // If already posted (lines exist), return existing
         if Self::tx_has_lines(tx, tx_id).await? {
             return Self::load_posted_by_tx_id_tx(tx, tx_id).await;
         }
 
-        // 2) Lock affected accounts in stable order
         let mut account_ids: Vec<i64> = posting.lines.iter().map(|l| l.account_id).collect();
         account_ids.sort_unstable();
         account_ids.dedup();
@@ -52,7 +55,6 @@ impl PgLedgerRepository {
             });
         }
 
-        // 3) Map rows -> domain and validate active
         let mut locked: HashMap<i64, LedgerAccount> = HashMap::with_capacity(locked_rows.len());
         for r in locked_rows {
             let acct = r.to_domain()?;
@@ -61,16 +63,21 @@ impl PgLedgerRepository {
                     message: format!("ledger account is inactive (account_id={})", acct.id()),
                 });
             }
+            if acct.asset_id() != posting.asset_id {
+                return Err(RepoError::Integrity {
+                    message: format!(
+                        "cross-asset posting attempt (account_id={}, account_asset_id={}, posting_asset_id={})",
+                        acct.id(),
+                        acct.asset_id(),
+                        posting.asset_id
+                    ),
+                });
+            }
             locked.insert(acct.id(), acct);
         }
 
-        // 4) Enforce single-asset journal
-        let _asset_id = Self::ensure_single_asset(tx, &account_ids).await?;
-
-        // 5) Lock+fetch running balances (FOR UPDATE)
         let current = Self::lock_and_fetch_balances(tx, &account_ids).await?;
 
-        // 6) Compute deltas (overflow-safe)
         let mut delta: HashMap<i64, i128> = HashMap::with_capacity(posting.lines.len());
         for l in &posting.lines {
             let entry = delta.entry(l.account_id).or_insert(0);
@@ -79,13 +86,12 @@ impl PgLedgerRepository {
             })?;
         }
 
-        // 7) Validate spendability against running balances
         for (account_id, d) in &delta {
             let acct = locked.get(account_id).ok_or_else(|| RepoError::NotFound {
                 entity: format!("ledger_account id={account_id}"),
             })?;
 
-            if Self::is_spendable_bucket(acct.account_type()) {
+            if Self::is_non_negative_bucket(acct.account_type()) {
                 let cur = *current.get(account_id).unwrap_or(&0);
                 let next = cur.checked_add(*d).ok_or_else(|| RepoError::Integrity {
                     message: format!("balance overflow (account_id={account_id})"),
@@ -94,31 +100,34 @@ impl PgLedgerRepository {
                 if next < 0 {
                     return Err(RepoError::Conflict {
                         message: format!(
-                            "insufficient funds (account_id={account_id}, current={cur}, delta={d})"
+                            "insufficient funds (account_id={account_id}, type={:?}, current={cur}, delta={d})",
+                            acct.account_type()
                         ),
                     });
                 }
             }
         }
 
-        // 8) Bulk insert journal lines (idempotent w/ unique (journal_tx_id, account_id))
         let mut line_account_ids = Vec::with_capacity(posting.lines.len());
         let mut line_amounts = Vec::with_capacity(posting.lines.len());
         for l in &posting.lines {
             line_account_ids.push(l.account_id);
-            line_amounts.push(i128_to_bigdecimal(l.amount.minor()));
+            line_amounts.push(i128_to_bd(l.amount.minor()));
         }
 
-        let inserted = Self::bulk_insert_lines(tx, tx_id, &line_account_ids, &line_amounts).await?;
+        let inserted = Self::bulk_insert_lines(
+            tx,
+            tx_id,
+            posting.asset_id,
+            &line_account_ids,
+            &line_amounts,
+        )
+            .await?;
 
-        // If 0 inserted, someone else already posted (idempotent replay / concurrent winner)
-        // Return the existing posted journal without applying deltas again.
         if inserted == 0 {
             return Self::load_posted_by_tx_id_tx(tx, tx_id).await;
         }
 
-        // Safety: partial insert should never happen if your ValidatedJournal is “compressed”,
-        // but protect against mismatch anyway.
         let expected = line_account_ids.len() as u64;
         if inserted != expected {
             return Err(RepoError::Integrity {
@@ -129,12 +138,12 @@ impl PgLedgerRepository {
             });
         }
 
-        // 9) Update running balances ONLY if we inserted lines now
         Self::apply_balance_deltas(tx, &delta).await?;
 
-        // 10) Return posted journal
         Self::load_posted_by_tx_id_tx(tx, tx_id).await
     }
+
+
 
     async fn fetch_accounts_for_update(
         tx: &mut Transaction<'_, Postgres>,
@@ -146,7 +155,7 @@ impl PgLedgerRepository {
 
         let rows = sqlx::query_as::<_, LedgerAccountRow>(
             r#"
-            SELECT id, public_id, owner_type, owner_id, account_type, asset_id, is_active
+            SELECT id, public_id, owner_type, owner_id, account_type, asset_id, region_code, is_active
             FROM ledger_accounts
             WHERE id = ANY($1)
             ORDER BY id
@@ -233,7 +242,7 @@ impl PgLedgerRepository {
 
         let lines = sqlx::query_as::<_, JournalLineRow>(
             r#"
-            SELECT account_id, amount
+            SELECT account_id, asset_id, amount
             FROM journal_lines
             WHERE journal_tx_id = $1
             ORDER BY id ASC
@@ -244,15 +253,12 @@ impl PgLedgerRepository {
             .await
             .map_err(map_sqlx)?;
 
-        let asset_id = if let Some(first) = lines.first() {
-            sqlx::query_scalar::<_, i16>("SELECT asset_id FROM ledger_accounts WHERE id = $1")
-                .bind(first.account_id)
-                .fetch_one(&mut **tx)
-                .await
-                .map_err(map_sqlx)?
-        } else {
-            0
-        };
+        let asset_id = lines
+            .first()
+            .map(|l| l.asset_id)
+            .ok_or_else(|| RepoError::Integrity {
+                message: format!("journal_tx_id={tx_id} has no lines"),
+            })?;
 
         map_posted_journal(header, lines, asset_id)
     }
@@ -272,7 +278,7 @@ impl PgLedgerRepository {
 
         let lines = sqlx::query_as::<_, JournalLineRow>(
             r#"
-            SELECT account_id, amount
+            SELECT account_id, asset_id, amount
             FROM journal_lines
             WHERE journal_tx_id = $1
             ORDER BY id ASC
@@ -283,15 +289,12 @@ impl PgLedgerRepository {
             .await
             .map_err(map_sqlx)?;
 
-        let asset_id = if let Some(first) = lines.first() {
-            sqlx::query_scalar::<_, i16>("SELECT asset_id FROM ledger_accounts WHERE id = $1")
-                .bind(first.account_id)
-                .fetch_one(pool)
-                .await
-                .map_err(map_sqlx)?
-        } else {
-            0
-        };
+        let asset_id = lines
+            .first()
+            .map(|l| l.asset_id)
+            .ok_or_else(|| RepoError::Integrity {
+                message: format!("journal_tx_id={tx_id} has no lines"),
+            })?;
 
         map_posted_journal(header, lines, asset_id)
     }
@@ -299,18 +302,20 @@ impl PgLedgerRepository {
     async fn bulk_insert_lines(
         tx: &mut Transaction<'_, Postgres>,
         tx_id: i64,
+        asset_id: i16,
         account_ids: &[i64],
         amounts: &[BigDecimal],
     ) -> Result<u64, RepoError> {
         let res = sqlx::query(
             r#"
-            INSERT INTO journal_lines (journal_tx_id, account_id, amount)
-            SELECT $1, x.account_id, x.amount
-            FROM UNNEST($2::bigint[], $3::numeric[]) AS x(account_id, amount)
+            INSERT INTO journal_lines (journal_tx_id, account_id, asset_id, amount)
+            SELECT $1, x.account_id, $2, x.amount
+            FROM UNNEST($3::bigint[], $4::numeric[]) AS x(account_id, amount)
             ON CONFLICT (journal_tx_id, account_id) DO NOTHING
             "#,
         )
             .bind(tx_id)
+            .bind(asset_id)
             .bind(account_ids)
             .bind(amounts)
             .execute(&mut **tx)
@@ -320,33 +325,16 @@ impl PgLedgerRepository {
         Ok(res.rows_affected())
     }
 
-    fn numeric0_to_i128_strict(v: &BigDecimal, account_id: i64) -> Result<i128, RepoError> {
-        let s = v.to_string();
-        if s.contains('.') {
-            return Err(RepoError::Integrity {
-                message: format!("non-integer numeric found (account_id={account_id})"),
-            });
-        }
-        s.parse::<i128>().map_err(|_| RepoError::Integrity {
-            message: format!("numeric out of i128 range (account_id={account_id})"),
-        })
-    }
-
     async fn lock_and_fetch_balances(
         tx: &mut Transaction<'_, Postgres>,
         account_ids: &[i64],
     ) -> Result<HashMap<i64, i128>, RepoError> {
-        #[derive(sqlx::FromRow)]
-        struct BalRow {
-            account_id: i64,
-            balance: BigDecimal,
-        }
 
         if account_ids.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let rows = sqlx::query_as::<_, BalRow>(
+        let rows = sqlx::query_as::<_, BalanceRow>(
             r#"
             SELECT account_id, balance
             FROM ledger_account_balances
@@ -369,55 +357,10 @@ impl PgLedgerRepository {
 
         let mut out = HashMap::with_capacity(account_ids.len());
         for r in rows {
-            let val = Self::numeric0_to_i128_strict(&r.balance, r.account_id)?;
+            let val = numeric0_to_i128_strict(&r.balance, r.account_id)?;
             out.insert(r.account_id, val);
         }
         Ok(out)
-    }
-
-    async fn ensure_single_asset(
-        tx: &mut Transaction<'_, Postgres>,
-        account_ids: &[i64],
-    ) -> Result<i16, RepoError> {
-        if account_ids.is_empty() {
-            return Err(RepoError::Integrity {
-                message: "posting has no accounts".into(),
-            });
-        }
-
-        let distinct = sqlx::query_scalar::<_, i64>(
-            r#"
-            SELECT COUNT(DISTINCT asset_id)
-            FROM ledger_accounts
-            WHERE id = ANY($1)
-            "#,
-        )
-            .bind(account_ids)
-            .fetch_one(&mut **tx)
-            .await
-            .map_err(map_sqlx)?;
-
-        if distinct != 1 {
-            return Err(RepoError::Integrity {
-                message: "posting spans multiple assets; split into separate journals per asset".into(),
-            });
-        }
-
-        let asset_id = sqlx::query_scalar::<_, i16>(
-            r#"
-            SELECT asset_id
-            FROM ledger_accounts
-            WHERE id = ANY($1)
-            ORDER BY id
-            LIMIT 1
-            "#,
-        )
-            .bind(account_ids)
-            .fetch_one(&mut **tx)
-            .await
-            .map_err(map_sqlx)?;
-
-        Ok(asset_id)
     }
 
     async fn apply_balance_deltas(
@@ -433,7 +376,7 @@ impl PgLedgerRepository {
 
         for (id, d) in delta {
             ids.push(*id);
-            deltas.push(i128_to_bigdecimal(*d));
+            deltas.push(i128_to_bd(*d));
         }
 
         let res = sqlx::query(
@@ -470,38 +413,29 @@ impl PgLedgerRepository {
 #[async_trait]
 impl LedgerRepository for PgLedgerRepository {
     async fn create_account(&self, spec: NewLedgerAccountSpec) -> Result<LedgerAccount, RepoError> {
+        let region = spec.region_code
+            .as_ref()
+            .map(|rc| rc.as_str().trim().to_uppercase());
+
         let row = sqlx::query_as::<_, LedgerAccountRow>(
             r#"
-            INSERT INTO ledger_accounts
-                (public_id, owner_type, owner_id, account_type, asset_id, is_active)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id, public_id, owner_type, owner_id, account_type, asset_id, is_active
-            "#,
+                INSERT INTO ledger_accounts
+                    (public_id, owner_type, owner_id, account_type, asset_id, region_code, is_active)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id, public_id, owner_type, owner_id, account_type, asset_id, region_code, is_active
+                "#,
         )
             .bind(spec.public_id.value())
-            .bind(match spec.owner_type {
-                crate::domain::entities::OwnerType::User => "USER",
-                crate::domain::entities::OwnerType::Platform => "PLATFORM",
-                crate::domain::entities::OwnerType::Treasury => "TREASURY",
-            })
+            .bind(spec.owner_type.as_str())
             .bind(spec.owner_id)
-            .bind(match spec.account_type {
-                AccountType::UserAvailable => "USER_AVAILABLE",
-                AccountType::UserLocked => "USER_LOCKED",
-                AccountType::PlatformClearing => "PLATFORM_CLEARING",
-                AccountType::TreasuryAvailable => "TREASURY_AVAILABLE",
-                AccountType::TreasuryLocked => "TREASURY_LOCKED",
-                AccountType::InventoryAvailable => "INVENTORY_AVAILABLE",
-                AccountType::InventoryLocked => "INVENTORY_LOCKED",
-            })
+            .bind(spec.account_type.as_str())
             .bind(spec.asset_id)
+            .bind(region)
             .bind(spec.is_active)
             .fetch_one(&self.pool)
             .await
             .map_err(map_sqlx)?;
 
-        // If you didn't create the trigger to auto-create balance rows,
-        // then insert a row here. If you DID create the trigger, this is safe anyway:
         sqlx::query(
             r#"
             INSERT INTO ledger_account_balances(account_id, balance)
@@ -541,7 +475,7 @@ impl LedgerRepository for PgLedgerRepository {
 
         let rows = sqlx::query_as::<_, LedgerAccountRow>(
             r#"
-            SELECT id, public_id, owner_type, owner_id, account_type, asset_id, is_active
+            SELECT id, public_id, owner_type, owner_id, account_type, asset_id, region_code, is_active
             FROM ledger_accounts
             WHERE id = ANY($1)
             "#,
@@ -578,7 +512,6 @@ impl LedgerRepository for PgLedgerRepository {
 
         let Some(id) = tx_id else { return Ok(None) };
 
-        // Read method: use pool loader (avoids any tx lifetime gymnastics)
         Ok(Some(Self::load_posted_by_tx_id(&self.pool, id).await?))
     }
 }

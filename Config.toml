@@ -8,6 +8,40 @@ max_lines_normal = 200
 max_lines_batch = 5000
 
 [ledger.max_post_amount]
-NGN = 10000000000     # ₦100,000,000
-USDT = 1000000000000  # 1,000,000 USDT (6 decimals)
-KES = 50000000000     # 50,000,000 KES
+NGN = 10000000000
+USDT = 1000000000000
+KES = 50000000000
+
+[fx]
+base_url = "https://api.forexrateapi.com"
+max_staleness_secs = 30
+firm_ttl_secs = 600
+enforce_direct_only = true
+
+[chain.solana]
+network = "DEVNET" # or "MAINNET"
+rpc_url = "https://api.devnet.solana.com"
+min_confirmations = 1
+
+# Not secret: mint address (base58)
+# In devnet: your USDT_TEST mint pubkey
+# In mainnet: real USDT mint pubkey
+usdt_mint = "So11111111111111111111111111111111111111112" # example placeholder
+
+[chain.solana.policy]
+max_submit_attempts = 5
+min_resubmit_delay_secs = 20
+stalled_max_unconfirmed_secs = 900
+stalled_max_check_gap_secs = 60
+
+
+[monnify]
+base_url = "https://sandbox.monnify.com"
+token_skew_secs = 30
+
+[monnify.paths]
+login = "/api/v1/auth/login"
+single_transfer = "/api/v2/disbursements/single"
+validate_otp = "/api/v2/disbursements/single/validate-otp"
+resend_otp = "/api/v2/disbursements/single/resend-otp"
+single_summary = "/api/v2/disbursements/single/summary"

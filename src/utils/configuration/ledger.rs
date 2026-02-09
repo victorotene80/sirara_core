@@ -8,7 +8,6 @@ use super::config::TomlConfig;
 pub struct LedgerConfig {
     pub max_lines_normal: usize,
     pub max_lines_batch: usize,
-    /// asset_code -> max_abs_minor (per journal line)
     pub max_post_amount_by_code: HashMap<String, i128>,
 }
 

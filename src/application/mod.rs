@@ -1,6 +1,6 @@
-mod commands;
+pub mod commands;
 mod query;
-mod dtos;
+pub mod dtos;
 pub mod contracts;
 mod error;
 pub use self::error::AppError;

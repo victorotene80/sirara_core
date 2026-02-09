@@ -1,72 +1,107 @@
-use chrono::Utc;
-use uuid::Uuid;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
-use crate::application::contracts::repository::{ReposInTx, UnitOfWork};
 use crate::application::AppError;
-use crate::domain::aggregate::{JournalDraft};
-use crate::domain::value_objects::{ExternalRef, ExternalRefType, Money, PublicId, TransferRoute};
+use crate::application::commands::create_internal_transfer::CreateInternalTransferCommand;
+use crate::application::commands::HoldUserFundsCommand;
 
-pub struct IntraTransferOrchestrator<U: UnitOfWork> {
-    uow: U,
+use crate::application::contracts::intra_transfer::InternalTransferService;
+use crate::application::contracts::LedgerService;
+use crate::application::contracts::repository::TxContext;
+
+use crate::application::dtos::transfer_intent_result::InternalTransferResult;
+use crate::domain::aggregate::TransferIntent;
+use crate::domain::value_objects::TransferRoute;
+
+pub struct InternalTransferServiceImpl<L: LedgerService> {
+    ledger: L,
 }
 
-impl<U: UnitOfWork> IntraTransferOrchestrator<U> {
-    pub fn new(uow: U) -> Self { Self { uow } }
+impl<L: LedgerService> InternalTransferServiceImpl<L> {
+    pub fn new(ledger: L) -> Self {
+        Self { ledger }
+    }
+}
 
-    pub async fn initiate_intra(
+#[async_trait]
+impl<L> InternalTransferService for InternalTransferServiceImpl<L>
+where
+    L: LedgerService + Send + Sync,
+{
+    async fn create_internal_transfer(
         &self,
-        from_user_id: Uuid,
-        to_user_id: Uuid,
-        asset_code: String,
-        amount_minor: i128,
-        external_ref: String,
-        created_by: String,
-    ) -> Result<Uuid, AppError> {
-        let now = Utc::now();
-        let public_id = PublicId::new(Uuid::new_v4());
+        ctx: &mut dyn TxContext,
+        cmd: CreateInternalTransferCommand,
+        now: DateTime<Utc>,
+    ) -> Result<InternalTransferResult, AppError> {
+        let CreateInternalTransferCommand {
+            public_id,
+            external_ref_type,
+            external_ref,
+            from_user_id,
+            region,
+            to_user_id,
+            asset,
+            amount,
+            initiated_by,
+        } = cmd;
 
-        self.uow.with_tx(move |repos: &mut dyn ReposInTx| {
-            Box::pin(async move {
-                let mut ledger = repos.ledger();
+        let (from_available, _from_locked) = {
+            let mut ledger_repo_tx = ctx.ledger();
+            ledger_repo_tx
+                .resolve_user_hold_accounts(from_user_id, &asset)
+                .await
+                .map_err(AppError::from)?
+        };
 
-                // Resolve accounts (fast, stable, no orchestration here)
-                let (from_avail, _from_locked) = ledger.resolve_user_hold_accounts(from_user_id, asset_code.clone()).await?;
-                let (to_avail, _to_locked) = ledger.resolve_user_hold_accounts(to_user_id, asset_code.clone()).await?;
+        let available_minor = self
+            .ledger
+            .peek_balance_minor(from_available)
+            .await?;
 
-                // Build route
-                let route = TransferRoute::IntraTransfer {
-                    from_user_id,
-                    to_user_id,
-                    asset: crate::domain::value_objects::AssetCode::new(asset_code.clone())?,
-                    amount: Money::from_signed_minor(amount_minor)?,
-                };
+        let required_minor = amount.minor();
 
-                // Create intent (persist via transfer repo once you add it; for now TODO)
-                // TODO(epic): persist TransferIntent + transitions (inter uses it heavily too)
+        if available_minor < required_minor {
+            return Ok(InternalTransferResult::RejectedInsufficientFunds {
+                available_minor,
+                required_minor,
+            });
+        }
 
-                // Ledger posting (atomic)
-                let mut draft = JournalDraft::new(
-                    PublicId::new(Uuid::new_v4()),
-                    ExternalRefType::TransferIntent,
-                    ExternalRef::new(external_ref)?,
-                    created_by,
-                    Some("intra transfer".into()),
-                )?;
+        let route = TransferRoute::intra_transfer(region.clone(), from_user_id, to_user_id)
+            .map_err(AppError::from)?;
 
-                // Debit sender, credit receiver
-                draft.add_line(from_avail, Money::from_signed_minor(-amount_minor)?); // credit
-                draft.add_line(to_avail, Money::from_signed_minor(amount_minor)?);   // debit
+        let intent = {
+            let mut repo = ctx.transfer();
 
-                let ids: Vec<i64> = draft.lines().iter().map(|l| l.account_id).collect();
-                let accounts = ledger.get_accounts_by_ids_for_validation(&ids).await?;
-                let mut by_id = std::collections::HashMap::new();
-                for a in &accounts { by_id.insert(a.id(), a); }
+            let intent = TransferIntent::new(
+                public_id,
+                external_ref_type,
+                external_ref,
+                route,
+                asset.clone(),
+                amount.clone(),
+                now,
+            )?;
 
-                let validated = draft.validate_with_accounts(&by_id)?;
-                let _posted = ledger.insert_posting_atomic(validated).await?;
+            repo.insert_intent_if_absent(intent)
+                .await
+                .map_err(AppError::from)?
+                .intent
+        };
 
-                Ok(public_id.value())
-            })
-        }).await
+        let hold_cmd = HoldUserFundsCommand {
+            journal_public_id: intent.public_id(),
+            external_ref: intent.external_ref().clone(),
+            created_by: initiated_by.clone().unwrap_or_else(|| "system".into()),
+            user_id: from_user_id,
+            asset_code: asset,
+            amount_minor: required_minor,
+            description: Some("internal transfer hold".to_string()),
+        };
+
+        self.ledger.hold_user_funds(hold_cmd).await?;
+
+        Ok(InternalTransferResult::Success { intent })
     }
 }

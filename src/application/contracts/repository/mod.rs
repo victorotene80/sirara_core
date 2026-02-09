@@ -1,13 +1,31 @@
 mod queries;
 mod uow;
-pub use uow::{UnitOfWork, BoxFut, ReposInTx};
+pub use uow::{UnitOfWork};
 mod ledger;
-mod transfer;
-pub use transfer::{
+mod transfer_intent;
+pub use transfer_intent::{
   TransferRepositoryTx,
   IntentPatch,
+  InsertIntentResult,
 };
 mod outbox;
-pub use outbox::OutboxRepositoryTx;
+mod tx_context;
+
+pub use tx_context::{
+  BoxFut,
+  TxContext,
+};
+
+mod onchain;
+mod wallet;
+pub use wallet::{
+  HotWalletRepositoryTx
+};
+
+pub use onchain::{
+  OnchainRepositoryTx
+};
+
+pub use outbox::{OutboxMessage, OutboxRepositoryTx};
 
 pub use ledger::LedgerRepositoryTx;

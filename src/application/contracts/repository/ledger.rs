@@ -1,8 +1,10 @@
+use uuid::Uuid;
+
 use crate::application::contracts::repository::BoxFut;
 use crate::domain::aggregate::{PostedJournal, ValidatedJournal};
-use crate::domain::repository::RepoError;
 use crate::domain::entities::LedgerAccount;
-use uuid::Uuid;
+use crate::domain::repository::RepoError;
+use crate::domain::value_objects::{AssetCode, RegionCode};
 
 pub trait LedgerRepositoryTx: Send {
     fn insert_posting_atomic(
@@ -18,7 +20,22 @@ pub trait LedgerRepositoryTx: Send {
     fn resolve_user_hold_accounts(
         &mut self,
         user_id: Uuid,
-        asset_code: String,
-    ) -> BoxFut<'_, Result<(i64, i64), RepoError>>; 
+        asset_code: &AssetCode,
+    ) -> BoxFut<'_, Result<(i64, i64), RepoError>>;
+
+    fn resolve_platform_inventory_accounts(
+        &mut self,
+        asset_code: &AssetCode,
+        region_code: &RegionCode,
+    ) -> BoxFut<'_, Result<(i64, i64), RepoError>>;
+
+    fn resolve_user_available_accounts(
+        &mut self,
+        from_user: Uuid,
+        to_user: Uuid,
+        asset_code: &AssetCode,
+    ) -> BoxFut<'_, Result<(LedgerAccount, LedgerAccount), RepoError>>;
+
+    fn peek_balance_minor(&mut self, account_id: i64) -> BoxFut<'_, Result<i128, RepoError>>;
 
 }

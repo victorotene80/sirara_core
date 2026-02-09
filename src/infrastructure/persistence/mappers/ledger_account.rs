@@ -1,6 +1,6 @@
 use crate::domain::entities::{AccountType, LedgerAccount, OwnerType};
 use crate::domain::repository::RepoError;
-use crate::domain::value_objects::PublicId;
+use crate::domain::value_objects::{PublicId, RegionCode};
 
 use crate::infrastructure::persistence::models::LedgerAccountRow;
 
@@ -10,11 +10,9 @@ impl LedgerAccountRow {
             "USER" => OwnerType::User,
             "PLATFORM" => OwnerType::Platform,
             "TREASURY" => OwnerType::Treasury,
-            other => {
-                return Err(RepoError::Integrity {
-                    message: format!("unknown owner_type={other} for ledger_account_id={}", self.id),
-                })
-            }
+            other => return Err(RepoError::Integrity {
+                message: format!("unknown owner_type={other} for ledger_account_id={}", self.id),
+            }),
         };
 
         let account_type = match self.account_type.as_str() {
@@ -25,21 +23,34 @@ impl LedgerAccountRow {
             "TREASURY_LOCKED" => AccountType::TreasuryLocked,
             "INVENTORY_AVAILABLE" => AccountType::InventoryAvailable,
             "INVENTORY_LOCKED" => AccountType::InventoryLocked,
-            other => {
-                return Err(RepoError::Integrity {
-                    message: format!("unknown account_type={other} for ledger_account_id={}", self.id),
-                })
-            }
+            other => return Err(RepoError::Integrity {
+                message: format!("unknown account_type={other} for ledger_account_id={}", self.id),
+            }),
         };
 
-        Ok(LedgerAccount::new(
+        let region_code = match &self.region_code {
+            None => None,
+            Some(raw) => Some(
+                RegionCode::new(raw.clone())
+                    .map_err(|e| RepoError::Integrity {
+                        message: format!("invalid region_code for ledger_account_id={}: {e}", self.id),
+                    })?
+            ),
+        };
+
+        LedgerAccount::new(
             self.id,
             PublicId::new(self.public_id),
             owner_type,
             self.owner_id,
             account_type,
             self.asset_id,
+            region_code,
             self.is_active,
-        ))
+        )
+            .map_err(|e| RepoError::Integrity {
+                message: format!("invalid ledger_account row id={}: {e}", self.id),
+            })
     }
+
 }
